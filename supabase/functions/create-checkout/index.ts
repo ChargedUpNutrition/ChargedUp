@@ -32,6 +32,8 @@ interface CheckoutRequest {
   customer: CustomerInfo;
   total: number;
   currency: string;
+  deliveryMethod?: string;
+  localDelivery?: boolean;
 }
 
 serve(async (req) => {
@@ -58,14 +60,19 @@ serve(async (req) => {
       throw new Error('Square location ID not configured');
     }
 
-    const { items, customer, total, currency }: CheckoutRequest = await req.json();
+    const { items, customer, total, currency, deliveryMethod, localDelivery }: CheckoutRequest = await req.json();
 
     console.log('Creating Square checkout for order:', {
       itemCount: items.length,
       total,
       customerEmail: customer.email,
       customerName: `${customer.firstName} ${customer.lastName}`,
-      locationId: squareLocationId
+      customerAddress: `${customer.address}, ${customer.city}, ${customer.state} ${customer.zipCode}`,
+      locationId: squareLocationId,
+      deliveryMethod,
+      localDelivery,
+      customerCity: customer.city,
+      customerState: customer.state
     });
 
     // Determine Square environment
@@ -80,10 +87,41 @@ serve(async (req) => {
     const subtotal = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
     console.log('Calculated subtotal:', subtotal);
 
-    // Calculate shipping cost (free shipping threshold is $55)
-    const freeShippingThreshold = 55;
-    const shippingCost = subtotal >= freeShippingThreshold ? 0 : 6.99;
-    console.log('Shipping cost:', shippingCost, 'Free shipping threshold:', freeShippingThreshold);
+    // Calculate shipping cost based on delivery method
+    let shippingCost = 0;
+    let shippingMethodName = 'Standard Shipping';
+    let orderNote = '';
+
+    if (localDelivery && deliveryMethod === 'local') {
+      // Validate local delivery eligibility
+      const isSanAngelo = customer.city.toLowerCase().trim() === 'san angelo';
+      const isTexas = customer.state.toLowerCase().trim() === 'tx' || customer.state.toLowerCase().trim() === 'texas';
+      
+      if (isSanAngelo && isTexas) {
+        shippingCost = 0;
+        shippingMethodName = 'Local Delivery (San Angelo Only)';
+        
+        // Create detailed order note with customer shipping information
+        orderNote = `Delivery method: Free Local Delivery (San Angelo)
+Customer: ${customer.firstName} ${customer.lastName}
+Phone: ${customer.phone || 'Not provided'}
+Delivery Address: ${customer.address}, ${customer.city}, ${customer.state} ${customer.zipCode}
+Email: ${customer.email}`;
+
+        console.log('Local delivery confirmed for San Angelo, TX - shipping cost: $0.00, adding detailed order note with customer info');
+      } else {
+        console.log('Local delivery requested but customer not in San Angelo, TX - falling back to standard shipping');
+        // Fall back to standard shipping
+        const freeShippingThreshold = 55;
+        shippingCost = subtotal >= freeShippingThreshold ? 0 : 6.99;
+        shippingMethodName = 'Standard Shipping';
+      }
+    } else {
+      // Standard shipping logic
+      const freeShippingThreshold = 55;
+      shippingCost = subtotal >= freeShippingThreshold ? 0 : 6.99;
+      console.log('Standard shipping cost:', shippingCost, 'Free shipping threshold:', freeShippingThreshold);
+    }
 
     // Create order items for Square
     const orderItems = items.map(item => ({
@@ -99,7 +137,7 @@ serve(async (req) => {
     // Add shipping as a line item if applicable
     if (shippingCost > 0) {
       orderItems.push({
-        name: 'Shipping',
+        name: shippingMethodName,
         quantity: '1',
         item_type: 'ITEM',
         base_price_money: {
@@ -107,44 +145,77 @@ serve(async (req) => {
           currency: currency.toUpperCase()
         }
       });
-      console.log('Added shipping line item:', shippingCost);
+      console.log('Added shipping line item:', shippingMethodName, shippingCost);
     } else {
-      console.log('Free shipping applied - no shipping line item added');
+      console.log('Free shipping applied - no shipping line item added. Method:', shippingMethodName);
     }
 
-    // Create checkout session with Square including customer name as display_name
+    // Format phone number to ensure it has +1 prefix
+    const formatPhoneNumber = (phone: string) => {
+      if (!phone) return '';
+      // Remove any existing country code and formatting
+      const cleaned = phone.replace(/\D/g, '');
+      // If it's a 10-digit US number, add +1
+      if (cleaned.length === 10) {
+        return `+1${cleaned}`;
+      }
+      // If it already has country code, ensure it starts with +1
+      if (cleaned.length === 11 && cleaned.startsWith('1')) {
+        return `+${cleaned}`;
+      }
+      // Return as is if already formatted or invalid
+      return phone.startsWith('+') ? phone : `+1${cleaned}`;
+    };
+
+    // Create checkout session with Square - Always ask for shipping address to ensure it's captured
     const checkoutRequest = {
       idempotency_key: crypto.randomUUID(),
       order: {
         location_id: squareLocationId,
-        line_items: orderItems
+        line_items: orderItems,
+        ...(orderNote && { note: orderNote })
       },
       checkout_options: {
         redirect_url: `${req.headers.get('origin')}/order-success`,
-        ask_for_shipping_address: true,
+        ask_for_shipping_address: true, // Always ask for shipping address
         accepted_payment_methods: {
           card: true,
           square_gift_card: false,
           google_pay: true,
           apple_pay: true,
           afterpay_clearpay: false
-        }
+        },
+        // Restrict to US only
+        allowed_locations: [{
+          country: 'US'
+        }]
       },
       pre_populated_data: {
         buyer_email: customer.email,
-        buyer_phone_number: customer.phone || '',
+        buyer_phone_number: formatPhoneNumber(customer.phone || ''),
         buyer_address: {
           address_line_1: customer.address,
           locality: customer.city,
           administrative_district_level_1: customer.state,
           postal_code: customer.zipCode,
-          country: customer.country
+          country: 'US' // Force US country
         },
-        buyer_display_name: `${customer.firstName} ${customer.lastName}`
+        buyer_display_name: `${customer.firstName} ${customer.lastName}`,
+        // Add first and last name separately for Square checkout form
+        buyer_first_name: customer.firstName,
+        buyer_last_name: customer.lastName
       }
     };
 
-    console.log('Sending checkout request to Square API:', JSON.stringify(checkoutRequest, null, 2));
+    console.log('Sending checkout request to Square API with customer name pre-populated:', JSON.stringify({
+      ...checkoutRequest,
+      shipping_address_included: true,
+      customer_address: checkoutRequest.pre_populated_data.buyer_address,
+      phone_formatted: checkoutRequest.pre_populated_data.buyer_phone_number,
+      customer_first_name: checkoutRequest.pre_populated_data.buyer_first_name,
+      customer_last_name: checkoutRequest.pre_populated_data.buyer_last_name,
+      order_note: orderNote || 'No note'
+    }, null, 2));
 
     const squareResponse = await fetch(`${squareApiBase}/v2/online-checkout/payment-links`, {
       method: 'POST',
@@ -170,7 +241,7 @@ serve(async (req) => {
       throw new Error(`Square API error: ${responseData.errors?.[0]?.detail || 'Unknown error'}`);
     }
 
-    console.log('Square checkout created successfully');
+    console.log('Square checkout created successfully with customer name pre-populated');
 
     const checkoutUrl = responseData.payment_link?.url;
     if (!checkoutUrl) {
